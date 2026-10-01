@@ -1,0 +1,19 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: seimas
+      POSTGRES_PASSWORD: seimas
+      POSTGRES_DB: seimas
+    ports:
+      - "5433:5432"          # 5433 to avoid clashing with a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seimas"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:

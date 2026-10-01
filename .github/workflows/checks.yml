@@ -1,0 +1,36 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: seimas
+          POSTGRES_PASSWORD: seimas
+          POSTGRES_DB: seimas
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U seimas"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://seimas:seimas@localhost:5433/seimas
+      OPENROUTER_API_KEY: ""
+      REQUIRE_DATABASE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --group rag --group docs --group eval --group youtube --group bench
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - name: Initialize test database
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
+      - run: uv run --no-sync pytest -q

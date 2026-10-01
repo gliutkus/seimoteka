@@ -1,0 +1,79 @@
+[project]
+name = "seimoteka"
+version = "0.1.0"
+description = "Domain-specialised RAG chatbot over the Lithuanian parliamentary record"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "lxml>=5.2",
+    "psycopg[binary]>=3.2",
+]
+
+[project.scripts]
+recon = "ingest.recon:main"
+
+[dependency-groups]
+# Phase 2+: retrieval, embeddings, UI. Install with:  uv sync --group rag
+rag = [
+    "langchain>=1.0",
+    "langchain-core>=1.0",
+    "pydantic>=2.0",
+    "pandas>=2.0",
+    "markdown-it-py>=3.0",
+    "langchain-openai>=0.2",
+    "openai>=1.55",
+    "streamlit>=1.40",
+    "pgvector>=0.3",
+    "langchain-openrouter>=0.2.8",
+]
+# Phase 3: Lithuanian lemmatisation for the BM25 side of hybrid search.
+nlp = [
+    "stanza>=1.9",
+]
+# Phase 7: RAG evaluation.
+eval = [
+    "ragas>=0.2",
+    "datasets>=3.0",
+]
+dev = [
+    "ruff>=0.8",
+    "pytest>=8.3",
+    # The OpenRouter and OpenAI SDKs and their HTTP clients, mocked by the tests
+    "openrouter>=0.10",
+    "httpx>=0.28",
+    "httpx2>=2.12",
+]
+youtube = [
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.8.19",
+]
+asr = [
+    "numpy>=1.26",
+    "huggingface-hub>=0.24",
+    "mlx-whisper>=0.4.3 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "sherpa-onnx>=1.13.8",
+    "sherpa-onnx-core==1.13.8",
+]
+bench = ["numpy>=1.26"]
+gemini = [
+    "google-genai>=1.0",
+]
+docs = [
+    "pypdf>=6.18.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ingest", "rag"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

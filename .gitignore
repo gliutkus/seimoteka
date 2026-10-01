@@ -1,0 +1,18 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+data/raw/
+data/samples/
+data/youtube/
+
+# Seimas harvest runtime state (progress, lock, verification output)
+data/seimas_*
+data/embed_bench/
+.DS_Store
+
+# Local secrets; retain only the documented example.
+.env.*
+!.env.example
+.streamlit/secrets.toml
