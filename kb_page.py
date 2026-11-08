@@ -66,6 +66,14 @@ MESSAGES = {
     "peržiūrai paruoštą įrašą.",
     "the last update finished less than an hour ago": "Nuo paskutinio atnaujinimo "
     "praėjo mažiau nei valanda.",
+    "only a job under review can be loaded": "Įkelti galima tik peržiūrėtą įrašą: "
+    "šis jau įkeliamas arba pasikeitė. Atnaujinkite puslapį.",
+    "voices can be assigned only while they are reviewed": "Balsus priskirti galima "
+    "tik peržiūros metu. Atnaujinkite puslapį.",
+    "a running job cannot be removed; wait until it finishes": "Apdorojamo įrašo "
+    "pašalinti negalima; palaukite, kol baigsis.",
+    "a running or loaded job cannot be deleted": "Apdorojamo ar jau įkelto įrašo "
+    "ištrinti negalima.",
 }
 UPDATE_STEPS = {
     "": "Ruošiamasi",
@@ -103,7 +111,7 @@ ARCHIVE_STATES = {
 }
 ARCHIVE_FILTERS = {
     "Laukia peržiūros": ("todo",),
-    "Pradėti, dar neįkelti": (*interviews.RUNNING, "review", "failed"),
+    "Pradėti, dar neįkelti": (*interviews.RUNNING, *interviews.WAITING),
     "Žinių bazėje": ("loaded",),
     "Seimo nario nėra": ("no_mp",),
     "Nuorašas netinkamas": ("unusable",),
@@ -180,7 +188,7 @@ def render(connection) -> None:
     jobs = interviews.all_jobs()
     if any(job["state"] in interviews.RUNNING for job in jobs):
         progress_panel()
-    waiting = [j for j in jobs if j["state"] in ("review", "failed")]
+    waiting = [j for j in jobs if j["state"] in interviews.WAITING]
     if waiting:
         st.subheader(f"Laukia jūsų: {len(waiting)}")
         for job in waiting:
@@ -712,7 +720,7 @@ def show_job(job: dict, members: dict[str, int]) -> None:
     state = STATES.get(job["state"], job["state"])
     with st.expander(
         literal(f"{state}: {job.get('title') or job['video_id']}"),
-        expanded=job["state"] in ("review", "failed"),
+        expanded=job["state"] in interviews.WAITING,
     ):
         facts = [f"[{job['url']}]({job['url']})"]
         if job.get("channel"):
@@ -828,8 +836,7 @@ def review(job: dict, members: dict[str, int]) -> None:
             else:
                 st.rerun()
     if st.button("Ištrinti šį darbą", key=f"forget-{vid}"):
-        interviews.forget(vid)
-        st.rerun()
+        attempt(interviews.forget, vid)
     if not submitted:
         return
     if not listened:
@@ -840,12 +847,15 @@ def review(job: dict, members: dict[str, int]) -> None:
             "Patvirtinkite, kad vektoriai gali būti kuriami raktu be išlaidų ribos."
         )
         return
-    interviews.assign(
-        job,
-        {voice: None if index == 0 else index - 1 for voice, index in choices.items()},
-    )
-    interviews.update(job, state="loading", stage="", error=None)
-    interviews.launch(vid, "load", *(["--allow-unlimited"] if allow else []))
+    try:
+        interviews.queue_load(
+            vid,
+            {voice: None if i == 0 else i - 1 for voice, i in choices.items()},
+            allow_unlimited=allow,
+        )
+    except ValueError as exc:
+        st.error(lithuanian(str(exc)))
+        return
     st.rerun()
 
 
@@ -881,17 +891,28 @@ def loaded(job: dict) -> None:
     st.markdown("\n".join(lines))
     if st.button("Pašalinti iš žinių bazės", key=f"remove-{job['video_id']}"):
         with st.spinner("Šalinama…"):
-            interviews.remove(job["video_id"])
-        st.rerun()
+            attempt(interviews.remove, job["video_id"])
 
 
 def failed(job: dict) -> None:
     retry, forget = st.columns(2)
     if retry.button("Bandyti dar kartą", key=f"retry-{job['video_id']}"):
-        interviews.start(
-            job["url"], job["participants"], voices=job.get("voices_expected")
+        attempt(
+            interviews.start,
+            job["url"],
+            job["participants"],
+            voices=job.get("voices_expected"),
         )
-        st.rerun()
     if forget.button("Ištrinti", key=f"forget-{job['video_id']}"):
-        interviews.forget(job["video_id"])
-        st.rerun()
+        attempt(interviews.forget, job["video_id"])
+
+
+def attempt(action, *args, **kwargs) -> None:
+    """Run a job action and show the page again, or say in Lithuanian why the
+    job's state did not allow it (another tab or a worker moved it meanwhile)."""
+    try:
+        action(*args, **kwargs)
+    except ValueError as exc:
+        st.error(lithuanian(str(exc)))
+        return
+    st.rerun()

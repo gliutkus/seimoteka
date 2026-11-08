@@ -227,6 +227,13 @@ the background, so the page can be closed.
   left. The work runs in its own process, so you can leave the page. An update
   clears the vote tables with DELETE, not TRUNCATE, so the chat keeps answering
   from the old data until the new data is saved.
+- **States.** Each kind of job declares its states and the moves between them
+  in one table, its `LIFECYCLE` (`ingest/lifecycle.py`). A job changes state
+  only through a move on that table. So a second click, a page left open in
+  another tab, or a command run at the wrong moment gets a clear message, and
+  the job is left as it was. An interview's passages are in the knowledge base
+  only while its job is loaded: a load that fails takes them back out.
+  `uv run python -m ingest.lifecycle` draws the tables as Mermaid diagrams.
 
 ## Decisions and trade-offs
 

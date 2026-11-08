@@ -23,7 +23,8 @@ button "Ieškoti naujų vaizdo įrašų":
 Nothing is transcribed here: the review page transcribes a video when it is
 prepared. Every request goes through the harvest's delay, and the run holds the
 YouTube harvest lock, so it never overlaps a harvest or an interview download.
-One run at a time, at most once an hour. The job is data/youtube/new_videos.json.
+One run at a time, at most once an hour. The job is data/youtube/new_videos.json;
+its states and the moves between them are LIFECYCLE (see ingest.lifecycle).
 """
 
 from __future__ import annotations
@@ -38,13 +39,24 @@ import time
 import traceback
 from datetime import UTC, datetime, timedelta
 
-from . import appearances, config, progress, youtube
+from . import appearances, config, lifecycle, progress, youtube
 
 JOB = youtube.ROOT / "new_videos.json"
 LOG = youtube.ROOT / "new_videos.log"
 LOCK = youtube.ROOT / "harvest.lock"
 PARTICIPANTS = youtube.ROOT / "participants.json"
-RUNNING = ("queued", "running")
+LIFECYCLE = lifecycle.Lifecycle(
+    "youtube_new",
+    lifecycle.moves(
+        ((None, "done", "failed"), "queued", "start()"),
+        ("queued", "running", "run(): the worker start() launched"),
+        ((None, "done", "failed"), "running", "run(): from the command line"),
+        ("running", "done", "run()"),
+        (("queued", "running"), "failed", "run() on an error, or current()"),
+    ),
+    running=("queued", "running"),
+)
+RUNNING = LIFECYCLE.running
 STEPS = ("roster", "search", "describe", "guess")
 COOLDOWN = timedelta(hours=1)
 STALE_START = 300  # seconds a queued run may wait for its worker to report in
@@ -74,31 +86,20 @@ def update(job: dict, **fields) -> dict:
     return job
 
 
-def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+move = lifecycle.mover(LIFECYCLE, update)
+alive = lifecycle.alive
 
 
 def current() -> dict | None:
     """The latest run; one whose worker died, or never started, has failed."""
     job = read()
-    if job is None or job["state"] not in RUNNING:
+    if job is None or not lifecycle.abandoned(
+        job, LIFECYCLE, datetime.now(UTC), STALE_START
+    ):
         return job
-    if alive(job.get("pid")):
-        return job
-    waited = datetime.now(UTC) - datetime.fromisoformat(job["updated_at"])
-    if not job.get("pid") and waited.total_seconds() < STALE_START:
-        return job
-    return update(
+    return move(
         job,
-        state="failed",
+        "failed",
         pid=None,
         finished_at=now(),
         error="the search stopped before it finished",
@@ -120,6 +121,7 @@ def start(*, launch_worker: bool = True) -> dict:
         raise ValueError("a search for new videos is already running")
     if minutes_to_wait(job):
         raise ValueError("the last search finished less than an hour ago")
+    LIFECYCLE.check(job and job["state"], "queued")
     queued = update(
         {
             "state": "queued",
@@ -253,13 +255,16 @@ def run(limit: int = LIMIT, *, search=None, fetch=fetch_page) -> dict:
     youtube.ROOT.mkdir(parents=True, exist_ok=True)
     with LOCK.open("w") as lock:
         job = read() or {}
+        pid = job.get("pid")
+        if job.get("state") in RUNNING and pid != os.getpid() and alive(pid):
+            raise SystemExit("a search for new videos is already running")
         if job.get("state") not in RUNNING:  # started from the command line
             job = {
                 "created_at": now(),
                 "last_success_at": job.get("last_success_at"),
                 "waiting": job.get("waiting") or [],
             }
-        job = update(job, state="running", pid=os.getpid(), error=None, steps={})
+        job = move(job, "running", pid=os.getpid(), error=None, steps={})
         try:
             update(job, stage="waiting for another YouTube download to finish")
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -284,9 +289,9 @@ def run(limit: int = LIMIT, *, search=None, fetch=fetch_page) -> dict:
             added = guess(list(dict.fromkeys(waiting + fetched)), members)
             left = pending(set(waiting))
             finished = now()
-            return update(
+            return move(
                 job,
-                state="done",
+                "done",
                 pid=None,
                 finished_at=finished,
                 last_success_at=finished,
@@ -299,9 +304,9 @@ def run(limit: int = LIMIT, *, search=None, fetch=fetch_page) -> dict:
         except BaseException as exc:
             traceback.print_exc()
             failed = now()
-            update(
+            move(
                 job,
-                state="failed",
+                "failed",
                 pid=None,
                 finished_at=failed,
                 error=f"{type(exc).__name__}: {exc}",

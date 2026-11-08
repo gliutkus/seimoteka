@@ -16,8 +16,11 @@ each also runs from the command line, from files/:
 
 A job is data/youtube/interviews/<video id>/job.json. Its state moves through
 queued, downloading, transcribing, separating and review, then loading and
-loaded; a step that fails records its error. One job is processed at a time,
-and downloads take the YouTube harvest lock, so they never overlap a harvest.
+loaded; a step that fails records its error. Every allowed move is listed in
+LIFECYCLE below, and move() refuses any other (`python -m ingest.lifecycle`
+draws it). A video's passages are in the knowledge base only while its job is
+loaded. One job is processed at a time, and downloads take the YouTube harvest
+lock, so they never overlap a harvest.
 
 What keeps interviews inside the project's rules:
 - A voice becomes a named speaker only when a person assigns it. Speech in a
@@ -59,7 +62,7 @@ import psycopg
 import requests
 from psycopg.types.json import Jsonb
 
-from . import config, progress, youtube, youtube_asr
+from . import config, lifecycle, progress, youtube, youtube_asr
 from .text import split_long
 from .transcripts import FOREIGN_SCRIPT, TRIMMED, repetition_loops, whisper_unreliable
 
@@ -86,7 +89,39 @@ UNKNOWN_SPEAKER = "Nenustatytas kalbėtojas"
 # than MIN_WORDS words ("Taip.") are not written.
 CRUMB_WORDS = 4
 MIN_WORDS = 5
-RUNNING = ("queued", "downloading", "transcribing", "separating", "loading")
+LIFECYCLE = lifecycle.Lifecycle(
+    "interview",
+    lifecycle.moves(
+        (None, "queued", "start()"),
+        ("failed", "queued", "start() again, or run() from the command line"),
+        (
+            "review",
+            "queued",
+            "separate_again(), start() again, or run() from the command line",
+        ),
+        ("queued", "downloading", "run()"),
+        ("downloading", "transcribing", "run()"),
+        ("transcribing", "separating", "run()"),
+        ("separating", "review", "run()"),
+        (
+            ("queued", "downloading", "transcribing", "separating"),
+            "failed",
+            "run() on an error, or refresh()",
+        ),
+        ("review", "loading", "queue_load(), or load() from the command line"),
+        ("loaded", "loading", "load() again from the command line"),
+        ("loading", "loaded", "load()"),
+        ("loading", "review", "load() on an error, or refresh()"),
+        ("loading", "failed", "refresh(), when the transcript is gone"),
+        (("loaded", "failed"), "review", "remove()"),
+        (("loaded", "review"), "failed", "remove(), when the transcript is gone"),
+        (("review", "failed"), None, "forget(), or mark_no_mp()"),
+    ),
+    running=("queued", "downloading", "transcribing", "separating", "loading"),
+    waiting=("review", "failed"),
+)
+RUNNING = LIFECYCLE.running
+WAITING = LIFECYCLE.waiting  # for a person: to say who speaks, or to try again
 STALE_START = 300  # seconds a queued job may wait for its worker to report in
 
 # Speaker separation: pyannote segmentation-3.0 finds who is active in each window
@@ -220,15 +255,23 @@ def save_job(job: dict) -> dict:
 
 
 def update(job: dict, **fields) -> dict:
+    """Write fields of a job as they are. Its state changes through move()."""
     job.update(fields)
     return save_job(job)
 
 
+move = lifecycle.mover(LIFECYCLE, update)
+
+
 def enter(job: dict, state: str, stage: str = "", **fields) -> dict:
     """Move a job to its next state, timing each state as a step."""
-    return update(
-        job, state=state, stage=stage, **progress.begin(job, state, now()), **fields
-    )
+    return move(job, state, stage=stage, **progress.begin(job, state, now()), **fields)
+
+
+def owned_elsewhere(job: dict) -> bool:
+    """Whether another live process is working on this job."""
+    pid = job.get("pid")
+    return job["state"] in RUNNING and pid != os.getpid() and alive(pid)
 
 
 def reporter(job: dict, unit: str):
@@ -247,33 +290,17 @@ def all_jobs() -> list[dict]:
     )
 
 
-def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+alive = lifecycle.alive
 
 
 def refresh(job: dict) -> dict:
     """A job whose worker died, or never started, stops waiting for it."""
-    if job["state"] not in RUNNING:
+    if not lifecycle.abandoned(job, LIFECYCLE, datetime.now(UTC), STALE_START):
         return job
-    if job.get("pid"):
-        if alive(job["pid"]):
-            return job
-    else:
-        updated = datetime.fromisoformat(job["updated_at"])
-        if (datetime.now(UTC) - updated).total_seconds() < STALE_START:
-            return job
     reviewable = (job_dir(job["video_id"]) / "utterances.json").exists()
     back = "review" if job["state"] == "loading" and reviewable else "failed"
-    return update(
-        job, state=back, stage="", pid=None, error="the step stopped before it finished"
+    return move(
+        job, back, stage="", pid=None, error="the step stopped before it finished"
     )
 
 
@@ -292,6 +319,7 @@ def start(
         raise ValueError("this video is already in the knowledge base; remove it first")
     if voices is not None and not 1 <= voices <= 10:
         raise ValueError("the number of voices must be between 1 and 10")
+    LIFECYCLE.check(existing and existing["state"], "queued")
     job_dir(video_id).mkdir(parents=True, exist_ok=True)
     job = save_job(
         {
@@ -743,6 +771,13 @@ def run(video_id: str) -> dict:
     job = read_job(video_id)
     if job is None:
         raise SystemExit(f"no job for {video_id}")
+    job = refresh(job)
+    if owned_elsewhere(job):
+        raise SystemExit(f"{video_id}: this video is already being processed")
+    if job["state"] == "loaded":
+        raise SystemExit(f"{video_id}: this video is in the knowledge base; remove it")
+    if job["state"] != "queued":  # run again from the command line
+        job = move(job, "queued", stage="", steps={}, progress=None)
     update(job, pid=os.getpid(), error=None)
     folder = job_dir(video_id)
     try:
@@ -774,9 +809,9 @@ def run(video_id: str) -> dict:
             unplaced = sum(
                 u["end"] - u["start"] for u in utterances if u["voice"] is None
             )
-            update(
+            move(
                 job,
-                state="review",
+                "review",
                 stage="",
                 pid=None,
                 **progress.finish(job, now()),
@@ -786,9 +821,9 @@ def run(video_id: str) -> dict:
             )
     except Exception as exc:
         traceback.print_exc()
-        update(
+        move(
             job,
-            state="failed",
+            "failed",
             stage="",
             pid=None,
             **progress.finish(job, now()),
@@ -806,9 +841,9 @@ def separate_again(video_id: str, voices: int, *, launch_worker: bool = True) ->
         raise ValueError("only a job under review can be separated again")
     if not 1 <= voices <= 10:
         raise ValueError("the number of voices must be between 1 and 10")
-    job = update(
+    job = move(
         job,
-        state="queued",
+        "queued",
         stage="",
         voices_expected=voices,
         voices=None,
@@ -846,6 +881,8 @@ def add_participant(job: dict, members: dict[str, int], name: str) -> dict:
 
 def assign(job: dict, assignment: dict[str, int | None]) -> dict:
     """Record who each voice is: a participant's index, or None for nobody."""
+    if job["state"] != "review":
+        raise ValueError("voices can be assigned only while they are reviewed")
     voices = {str(v["voice"]) for v in job.get("voices") or []}
     clean: dict[str, int | None] = {}
     for voice, who in assignment.items():
@@ -855,6 +892,25 @@ def assign(job: dict, assignment: dict[str, int | None]) -> dict:
             raise ValueError(f"there is no participant {who}")
         clean[str(voice)] = who
     return update(job, assignment=clean, reviewed_at=now())
+
+
+def queue_load(
+    video_id: str,
+    assignment: dict[str, int | None],
+    *,
+    allow_unlimited: bool = False,
+    launch_worker: bool = True,
+) -> dict:
+    """Record who each voice is and load the passages in the background. The job
+    is read again first, so a second click, or a page left open, cannot start a
+    second load."""
+    job = read_job(video_id)
+    if job is None or refresh(job)["state"] != "review":
+        raise ValueError("only a job under review can be loaded")
+    job = move(assign(job, assignment), "loading", stage="", error=None)
+    if launch_worker:
+        launch(video_id, "load", *(["--allow-unlimited"] if allow_unlimited else []))
+    return job
 
 
 # ----------------------------------------------------------- harvested archive
@@ -921,7 +977,7 @@ def review_states(videos: list[dict]) -> dict[str, str]:
 def mark_no_mp(video_id: str, note: str = "") -> None:
     """Record that a person checked the video and found no MP speaking in it."""
     job = read_job(video_id)
-    if job and refresh(job)["state"] in (*RUNNING, "loaded"):
+    if job and not LIFECYCLE.allows(refresh(job)["state"], None):
         raise ValueError("a running or loaded job cannot be marked")
     marked = youtube.read(JOBS / NO_MP) or {}
     marked[video_id] = {"at": now(), "note": note.strip()}
@@ -1109,9 +1165,15 @@ def load(
     job = read_job(video_id)
     if job is None:
         raise SystemExit(f"no job for {video_id}")
+    job = refresh(job)
+    if owned_elsewhere(job):
+        raise ValueError("this video is already being processed")
+    if not LIFECYCLE.allows(job["state"], "loading"):
+        raise ValueError("only a job under review can be loaded")
     update(job, pid=os.getpid(), error=None, steps={})
     enter(job, "loading", "writing passages")
     own = conn is None
+    written = False
     try:
         utterances = youtube.read(job_dir(video_id) / "utterances.json")
         if not utterances:
@@ -1131,6 +1193,7 @@ def load(
                 )
         conn = conn or psycopg.connect(config.DATABASE_URL, autocommit=True)
         document_id, count = write_document(conn, job, utterances)
+        written = True
         update(job, stage="embedding passages")
         report = reporter(job, "passages")
         result = embed.embed_corpus(
@@ -1145,9 +1208,9 @@ def load(
         update(job, stage="refreshing search statistics", progress=None)
         retrieval.refresh_stats(conn)
         (job_dir(video_id) / "audio.wav").unlink(missing_ok=True)
-        return update(
+        return move(
             job,
-            state="loaded",
+            "loaded",
             stage="",
             pid=None,
             **progress.finish(job, now()),
@@ -1158,13 +1221,25 @@ def load(
         )
     except Exception as exc:
         traceback.print_exc()
-        return update(
+        error = f"{type(exc).__name__}: {exc}"
+        if written:  # back under review, the passages leave the knowledge base
+            try:
+                with conn.transaction():
+                    delete_document(conn, job["url"])
+                retrieval.refresh_stats(conn)
+            except Exception as undo:
+                traceback.print_exc()
+                error += (
+                    f"; its passages could not be taken out ({type(undo).__name__}):"
+                    " load it again or remove it"
+                )
+        return move(
             job,
-            state="review",
+            "review",
             stage="",
             pid=None,
             **progress.finish(job, now()),
-            error=f"{type(exc).__name__}: {exc}",
+            error=error,
         )
     finally:
         if own and conn is not None:
@@ -1175,6 +1250,9 @@ def remove(video_id: str, conn=None) -> dict | None:
     """Take a video's passages out of the knowledge base; its review stays."""
     from rag import retrieval
 
+    job = read_job(video_id)
+    if job and (refresh(job)["state"] in RUNNING):
+        raise ValueError("a running job cannot be removed; wait until it finishes")
     own = conn is None
     conn = conn or psycopg.connect(config.DATABASE_URL, autocommit=True)
     try:
@@ -1189,9 +1267,9 @@ def remove(video_id: str, conn=None) -> dict | None:
         return None
     reviewable = (job_dir(video_id) / "utterances.json").exists()
     # Taken out, it is reviewed from scratch: the old assignment is not offered.
-    return update(
+    return move(
         job,
-        state="review" if reviewable else "failed",
+        "review" if reviewable else "failed",
         document_id=None,
         chunks=None,
         assignment={},
@@ -1203,7 +1281,7 @@ def remove(video_id: str, conn=None) -> dict | None:
 def forget(video_id: str) -> None:
     """Delete a job that is neither running nor loaded, with its files."""
     job = read_job(video_id)
-    if job and refresh(job)["state"] in (*RUNNING, "loaded"):
+    if job and not LIFECYCLE.allows(refresh(job)["state"], None):
         raise ValueError("a running or loaded job cannot be deleted")
     shutil.rmtree(job_dir(video_id), ignore_errors=True)
 
@@ -1275,12 +1353,21 @@ def main(argv: list[str] | None = None) -> None:
             if label not in labels:
                 raise SystemExit(f"no voice {label}; voices: {', '.join(labels)}")
             wanted[labels[label]] = None if who in ("-", "") else int(who) - 1
-        assign(job, wanted)
+        try:
+            assign(job, wanted)
+        except ValueError as exc:
+            raise SystemExit(f"{args.video_id}: {exc}") from exc
     elif args.command == "load":
-        job = load(args.video_id, allow_unlimited=args.allow_unlimited)
+        try:
+            job = load(args.video_id, allow_unlimited=args.allow_unlimited)
+        except ValueError as exc:
+            raise SystemExit(f"{args.video_id}: {exc}") from exc
         print(f"{args.video_id}: {job['state']} {job.get('error') or ''}")
     elif args.command == "remove":
-        remove(args.video_id)
+        try:
+            remove(args.video_id)
+        except ValueError as exc:
+            raise SystemExit(f"{args.video_id}: {exc}") from exc
     else:
         for job in all_jobs():
             stage, title = job.get("stage") or "", job.get("title") or job["url"]

@@ -21,6 +21,7 @@ same steps in the background with one button:
 One update runs at a time. Every run asks lrs.lt again for its recent listings,
 so a new one may start only an hour after the last successful one. The job is
 data/seimas_update.json, and the output of a background run data/seimas_update.log.
+Its states and the moves between them are LIFECYCLE (see ingest.lifecycle).
 """
 
 from __future__ import annotations
@@ -39,14 +40,25 @@ from pathlib import Path
 import psycopg
 import requests
 
-from . import config, progress, seimas, stenograms
+from . import config, lifecycle, progress, seimas, stenograms
 
 JOB = config.DATA_DIR / "seimas_update.json"
 LOG = config.DATA_DIR / "seimas_update.log"
 LOCK = config.DATA_DIR / "seimas_update.lock"
 # The verify counts behind the vote record in the database.
 ACCEPTED = config.DATA_DIR / "seimas_verify_accepted.json"
-RUNNING = ("queued", "running")
+LIFECYCLE = lifecycle.Lifecycle(
+    "update",
+    lifecycle.moves(
+        ((None, "done", "failed"), "queued", "start()"),
+        ("queued", "running", "run(): the worker start() launched"),
+        ((None, "done", "failed"), "running", "run(): from the command line"),
+        ("running", "done", "run()"),
+        (("queued", "running"), "failed", "run() on an error, or current()"),
+    ),
+    running=("queued", "running"),
+)
+RUNNING = LIFECYCLE.running
 STEPS = (
     "votes_download",
     "votes_check",
@@ -105,35 +117,19 @@ def update(job: dict, **fields) -> dict:
     return save(job)
 
 
-def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+move = lifecycle.mover(LIFECYCLE, update)
+alive = lifecycle.alive
 
 
 def current() -> dict | None:
     """The latest update; one whose worker died, or never started, has failed."""
     job = read()
-    if job is None or job["state"] not in RUNNING:
+    now_ = datetime.now(seimas.VILNIUS)
+    if job is None or not lifecycle.abandoned(job, LIFECYCLE, now_, STALE_START):
         return job
-    if job.get("pid"):
-        if alive(job["pid"]):
-            return job
-    else:
-        waited = datetime.now(seimas.VILNIUS) - datetime.fromisoformat(
-            job["updated_at"]
-        )
-        if waited.total_seconds() < STALE_START:
-            return job
-    return update(
+    return move(
         job,
-        state="failed",
+        "failed",
         failed_step=job.get("step", ""),
         step="",
         pid=None,
@@ -159,6 +155,7 @@ def start(mode: str = "update", *, allow_unlimited: bool = False) -> dict:
         raise ValueError("an update is already running")
     if mode == "update" and minutes_to_wait(job):
         raise ValueError("the last update finished less than an hour ago")
+    LIFECYCLE.check(job and job["state"], "queued")
     queued = save(
         {
             "mode": mode,
@@ -356,10 +353,10 @@ def run(mode: str = "update", *, allow_unlimited: bool = False, conn=None) -> di
     job = read() or {}
     if job.get("state") not in RUNNING:  # started from the command line
         job = {"created_at": now(), "last_success_at": job.get("last_success_at")}
-    job = update(
+    job = move(
         job,
+        "running",
         mode=mode,
-        state="running",
         step="",
         pid=os.getpid(),
         allow_unlimited=allow_unlimited,
@@ -386,9 +383,9 @@ def run(mode: str = "update", *, allow_unlimited: bool = False, conn=None) -> di
                 "error": f"{type(exc).__name__}: {exc}",
             }
         finished = now()
-        return update(
+        return move(
             job,
-            state="done",
+            "done",
             step="",
             pid=None,
             finished_at=finished,
@@ -401,9 +398,9 @@ def run(mode: str = "update", *, allow_unlimited: bool = False, conn=None) -> di
     except (Exception, SystemExit) as exc:
         traceback.print_exc()
         failed = now()
-        return update(
+        return move(
             job,
-            state="failed",
+            "failed",
             failed_step=job.get("step", ""),
             step="",
             pid=None,

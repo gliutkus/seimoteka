@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import sys
 import wave
 from datetime import UTC, date, datetime, timedelta
@@ -755,3 +756,68 @@ class FakeConn:
 
     def close(self):
         pass
+
+
+# ------------------------------------------------------------------ lifecycle
+
+
+def test_a_second_click_or_an_old_tab_cannot_start_a_second_load(jobs, monkeypatch):
+    launched = []
+    monkeypatch.setattr(interviews, "launch", lambda *args: launched.append(args))
+    job = reviewed_job(jobs, [], None)
+    stale = dict(job)  # what a page left open still holds
+    interviews.queue_load(VIDEO, {"0": 0, "1": 1})
+    assert interviews.read_job(VIDEO)["state"] == "loading"
+    with pytest.raises(ValueError, match="only a job under review"):
+        interviews.queue_load(VIDEO, {"0": 1, "1": 0})
+    with pytest.raises(ValueError, match="only while they are reviewed"):
+        interviews.assign(interviews.read_job(VIDEO), {"0": 1})
+    assert stale["state"] == "review"
+    assert launched == [(VIDEO, "load")]
+    assert interviews.read_job(VIDEO)["assignment"] == {"0": 0, "1": 1}
+
+
+def test_a_load_that_fails_takes_its_passages_back_out(db, jobs):
+    utterances = [
+        {
+            "voice": 0,
+            "start": 0.0,
+            "end": 9.0,
+            "text": "Labas vakaras, šiandien kalbame apie mokesčius",
+        }
+    ]
+    reviewed_job(jobs, utterances, {"0": 0, "1": 1})
+
+    def broken(texts, *, model, dims, key):
+        raise RuntimeError("provider down")
+
+    job = interviews.load(VIDEO, conn=db, embedder=broken)
+    assert job["state"] == "review" and "provider down" in job["error"]
+    # under review, nothing of the video is searchable, so forgetting it is safe
+    assert db.execute("SELECT count(*) FROM documents").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+
+
+def test_a_loaded_or_running_job_is_not_run_again_or_removed(jobs):
+    job = interviews.start(f"https://youtu.be/{VIDEO}", PEOPLE, launch_worker=False)
+    interviews.update(job, state="loaded")
+    with pytest.raises(SystemExit, match="in the knowledge base"):
+        interviews.run(VIDEO)
+    with pytest.raises(ValueError, match="only a job under review"):
+        interviews.queue_load(VIDEO, {})
+    interviews.update(interviews.read_job(VIDEO), state="separating", pid=os.getppid())
+    with pytest.raises(ValueError, match="running job cannot be removed"):
+        interviews.remove(VIDEO)
+    with pytest.raises(SystemExit, match="already being processed"):
+        interviews.run(VIDEO)
+    assert interviews.read_job(VIDEO)["state"] == "separating"
+
+
+def test_a_failed_job_run_again_from_the_command_line_starts_over(jobs, monkeypatch):
+    monkeypatch.setattr(interviews.youtube, "ROOT", jobs.parent)
+    job = interviews.start(f"https://youtu.be/{VIDEO}", PEOPLE, launch_worker=False)
+    interviews.update(job, state="failed", error="earlier")
+    fake_steps(monkeypatch, {"title": "Pokalbis", "duration": 552})
+    job = interviews.run(VIDEO)
+    assert job["state"] == "review", job["error"]
+    assert list(job["steps"]) == ["downloading", "transcribing", "separating"]
